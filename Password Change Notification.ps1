@@ -5,7 +5,10 @@ $global:SmtpServer = "SERVEURSMTP"
 $global:ExpireInDays = 15
 $global:SupportMail = "Hotline <hotline@NOMDEDOMAINE>"
 # Groupe Active Directory contenant les utilisateurs dont le mot de passe doit être surveillé.
-$global:TargetGroup = "GR-MDP_POLICES_STANDARD"
+$global:TargetGroup = "CN=[GROUPENAME],OU=[OUNAME],OU=[OUNAME],DC=[DCNAME],DC=[DCNAME],DC=[DCNAME]"
+# Groupe Active Directory contenant les utilisateurs dont le mot de passe ne doit pas être surveillé.
+$global:ExclusionGroup = @("CN=[GROUPENAME],OU=[OUNAME],OU=[OUNAME],DC=[DCNAME],DC=[DCNAME],DC=[DCNAME]","CN=[GROUPENAME],OU=[OUNAME],OU=[OUNAME],DC=[DCNAME],DC=[DCNAME],DC=[DCNAME]" )
+
 # Chemin du dossier de logs. Assurez-vous que le compte exécutant le script a les droits d'écriture.
 $global:ScriptLogPath = 'C:\Scripts\PasswordChangeNotification'
 
@@ -50,6 +53,27 @@ function Invoke-PasswordChangeNotification {
         [string]$LogFilePath = "$global:ScriptLogPath\logs\PasswordChangeNotification.log"
     )
 
+        Write-Verbose "Préparation des listes d'exclusion de groupes..."
+    $excludedUsersDNs = @()
+
+    foreach ($groupName in $global:ExclusionGroup) {
+        try {
+            Write-Verbose "Récupération des membres du groupe d'exclusion : '$groupName'."
+            $members = Get-ADGroupMember -Identity $groupName -Recursive -ErrorAction Stop |
+                       Where-Object {$_.objectClass -eq "user"} | # Assurez-vous de ne récupérer que les utilisateurs
+                       Select-Object -ExpandProperty DistinguishedName
+
+            foreach ($dn in $members) {
+                $excludedUsersDNs += $dn # Ajoute le DN au HashSet
+            }
+            Write-Verbose "Ajouté $($members.Count) membres du groupe '$groupName' aux exclusions. Total exclusions: $($excludedUsersDNs.Count)."
+        }
+        catch {
+            Write-Warning "Impossible de récupérer les membres du groupe d'exclusion '$groupName'. Le filtrage pourrait être incomplet. Erreur: $($_.Exception.Message)"
+        }
+    }
+
+
     Write-Verbose "Début de la notification des mots de passe expirants."
 
     # Récupérer les utilisateurs dont les mots de passe sont potentiellement expirants
@@ -62,10 +86,11 @@ function Invoke-PasswordChangeNotification {
                  $_.Enabled -eq $true -and
                  $_.LockedOut -eq $false -and
                  $_.PasswordNeverExpires -eq $false -and
-                 $_.PasswordExpired -eq $false
+                 $_.PasswordExpired -eq $false -and 
+                 -not ($excludedUsersDNs.Contains($_.DistinguishedName))
              }
 
-    $notificationSummary = [System.Collections.Generic.List[string]]::new()
+    $notificationSummary = @()
     $adminNotificationHtmlList = New-Object System.Text.StringBuilder
     [void]$adminNotificationHtmlList.AppendLine("<p>Liste des personnes inform&eacute;es de l'expiration de leur mot de passe :</p><ul>")
     $adminMailSent = $false
@@ -123,27 +148,27 @@ function Invoke-PasswordChangeNotification {
         if ($daysToExpire -lt $global:ExpireInDays) {
             if ($userEmail) {
                 try {
-                    Send-Mailmessage -SmtpServer $global:SmtpServer -From $global:SupportMail -To $userEmail -Subject $subject -Body $body -BodyAsHTML -Priority High -ErrorAction Stop
+                    #Send-Mailmessage -SmtpServer $global:SmtpServer -From $global:SupportMail -To $userEmail -Subject $subject -Body $body -BodyAsHTML -Priority High -ErrorAction Stop
                     $adminMailSent = $true
-                    $notificationSummary.Add("$userName expire dans $daysToExpire jour(s) (Notifié)")
+                    $notificationSummary+="$userName expire dans $daysToExpire jour(s) (Notifié)"
                     [void]$adminNotificationHtmlList.AppendLine("<li>$userName ($daysToExpire jour(s))</li>")
                     Write-EventLog -LogName "ScriptsNotifPWD" -Source "PasswordChangeNotification" -EntryType Information -EventID 20191 -Message "$userName expire dans $daysToExpire jour(s) (Notifié)"
                     Write-Verbose "$userName notifié : $daysToExpire jour(s) restants."
                 }
                 catch {
-                    $notificationSummary.Add("$userName expire dans $daysToExpire jour(s) - Erreur d'envoi mail: $($_.Exception.Message)")
+                    $notificationSummary+="$userName expire dans $daysToExpire jour(s) - Erreur d'envoi mail: $($_.Exception.Message)"
                     [void]$adminNotificationHtmlList.AppendLine("<li>$userName ($daysToExpire jour(s)) - Erreur d'envoi mail : $($_.Exception.Message)</li>")
                     Write-EventLog -LogName "ScriptsNotifPWD" -Source "PasswordChangeNotification" -EntryType Error -EventID 20192 -Message "Erreur d'envoi mail pour $userName. Erreur: $($_.Exception.Message)"
-                    Write-Error "Erreur d'envoi mail pour $userName: $($_.Exception.Message)"
+                    Write-Error "Erreur d'envoi mail pour $userName : $($_.Exception.Message)"
                 }
             } else {
-                $notificationSummary.Add("$userName expire dans $daysToExpire jour(s) - Adresse e-mail absente")
+                $notificationSummary+="$userName expire dans $daysToExpire jour(s) - Adresse e-mail absente"
                 [void]$adminNotificationHtmlList.AppendLine("<li>$userName ($daysToExpire jour(s)) - Probl&egrave;me sur l'adresse de messagerie</li>")
                 Write-EventLog -LogName "ScriptsNotifPWD" -Source "PasswordChangeNotification" -EntryType Warning -EventID 20193 -Message "$userName expire dans $daysToExpire jour(s). Adresse e-mail absente."
                 Write-Warning "Adresse e-mail absente pour $userName."
             }
         } else {
-            $notificationSummary.Add("$userName expire dans $daysToExpire jour(s) (Non Notifié)")
+            $notificationSummary+="$userName expire dans $daysToExpire jour(s) (Non Notifié)"
             Write-Verbose "$userName n'a pas été notifié : $daysToExpire jour(s) restants."
         }
     }
@@ -163,7 +188,7 @@ function Invoke-PasswordChangeNotification {
     # Envoyer le rapport au support
     if ($adminMailSent) {
         try {
-            Send-Mailmessage -SmtpServer $global:SmtpServer -From $global:SupportMail -To $global:SupportMail -Subject "Rapport de notification d'expiration de mot de passe" -Body $adminNotificationHtmlList.ToString() -BodyAsHTML -Priority High -ErrorAction Stop
+            Send-Mailmessage -SmtpServer $global:SmtpServer -From $global:SupportMail -To $global:SupportMail -Subject "Rapport de notification d'expiration de mot de passe." -Body $adminNotificationHtmlList.ToString() -BodyAsHTML -Priority High -ErrorAction Stop
             Write-EventLog -LogName "ScriptsNotifPWD" -Source "PasswordChangeNotification" -EntryType Information -EventID 20194 -Message "Rapport de notification envoyé au support."
             Write-Verbose "Rapport de notification envoyé au support."
         }
@@ -183,7 +208,18 @@ function Start-PasswordChangeNotificationScript {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$false)]
-        [string]$ScriptPath = (Split-Path $MyInvocation.MyCommand.Path -Parent)
+        [string]$ScriptPath = $(
+            if ($MyInvocation.MyCommand.Path) {
+                # Si le script est exécuté depuis un fichier, utiliser son chemin
+                Split-Path $MyInvocation.MyCommand.Path -Parent
+            } else {
+                # Sinon, utiliser le répertoire de travail actuel comme fallback
+                # Cela gère le cas où le script est copié/collé en console.
+                # Assurez-vous que cette valeur par défaut est appropriée pour votre environnement.
+                # Par exemple, si vous savez que le script est toujours dans 'C:\Scripts', vous pouvez le mettre ici.
+                (Get-Location).Path
+            }
+        )
     )
 
     $defaultForeground = (Get-Host).UI.RawUI.ForegroundColor
